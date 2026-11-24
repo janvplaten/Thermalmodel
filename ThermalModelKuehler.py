@@ -82,9 +82,9 @@ class ThermalModel:
 
     def reset(self):
 
-        T_Air   = np.random.uniform(10.0, 50.0)
-        T_Cool  = np.random.uniform(10.0, 50.0)
-        T_Bat   = np.random.uniform(10.0, 50.0)
+        T_Air = np.random.uniform(20.0, 30.0)
+        T_Cool = np.random.uniform(25.0, 35.0)
+        T_Bat = np.random.uniform(25.0, 35.0)
             
         self.x[0] = T_Air
         self.x[1] = T_Cool
@@ -113,7 +113,7 @@ class ThermalModel:
 
         al_Hx_Cool  = np.interp( Vp, self.BP_Vp_alpha_Vp, self.alpha_KW_Batt)
 
-        Q = al_Hx_Cool * (self.x[3] - self.x[4]) * self.dt
+        Q = al_Hx_Cool * (self.x[3] - self.x[4])
         return float(Q)
 
     def Q_Mix(self, Vp, T_in, T_out, Bypass):
@@ -148,7 +148,7 @@ class ThermalModel:
         ])
 
 
-        dT = (Q_trans + Q_mix) / self.cp
+        dT = (Q_trans + Q_mix) * self.dt / self.cp
 
         self.x = self.x + dT
 
@@ -169,13 +169,13 @@ class EnvThermalNetwerk:
 
         self.sys = ThermalModel(0.2)
 
-        self.OBS_Mean    = np.array([20.0, 35.0, 35.0, 35.0, 30.0, 30.0, 1000.0, 100.0, 0, 0, 0])
-        self.OBS_Std     = np.array([30.0, 45.0, 45.0, 45.0, 40.0, 40.0, 1000.0, 100.0, 1, 1, 1])
+        self.OBS_Mean    = np.array([20.0, 35.0, 35.0, 35.0, 30.0, 30.0, 1000.0, 100.0, 0, 0, 0, 0])
+        self.OBS_Std     = np.array([30.0, 45.0, 45.0, 45.0, 40.0, 40.0, 1000.0, 100.0, 1, 1, 1, 1])
 
         self.episode_len = episode_len
 
         self.action_dim = 4
-        self.obs_dim = 11
+        self.obs_dim = 12
 
         self.last_action = np.zeros(
             self.action_dim,
@@ -189,7 +189,7 @@ class EnvThermalNetwerk:
         n_steps = int(self.episode_len / self.sys.dt) 
 
         self.Cycle_t    = torch.arange(n_steps + 1, dtype=torch.float32, device=DEVICE) * self.sys.dt
-        T       = 30
+        T       = 60
         match Input:
             case "sin":
                 self.Cycle_V = (torch.sin(2 * math.pi * self.Cycle_t / T) + 1 ) * Vmax/2
@@ -199,7 +199,7 @@ class EnvThermalNetwerk:
 
     def reset(self):
 
-        self.T_set = np.random.uniform(25.0, 50.0)
+        self.T_set = np.random.uniform(33.0, 40.0)
 
         self.select_Cycle("sin", 200)
 
@@ -254,7 +254,8 @@ class EnvThermalNetwerk:
             V,
             self.last_action[0],
             self.last_action[1],
-            self.last_action[2]
+            self.last_action[2],
+            self.last_action[3]
         ])
 
         return (obs - self.OBS_Mean) / self.OBS_Std
@@ -298,22 +299,23 @@ class EnvThermalNetwerk:
 
         reward = (
             -0.2 * err ** 2
-            -0.001 * heater_cost
+            -0.02 * heater_cost
             -0.001 * fan_cost
             -0.001 * flow_cost ** 2
-            -0.00 * action_change ** 2
+            -0.001 * action_change ** 2
             )
 
         reward -= 0.01 * Bypass * err
         reward -= 0.01 * heater_cost * err
         reward += 0.01 * fan_cost * err
-        # reward += 0.05 * flow_cost * abs(err) 
+        reward += 0.05 * flow_cost * abs(err) 
 
         if unsafe:
             reward -= 100.0
 
-        if simultaneity_cost > 0.05:
-            reward -= 10.0 * (simultaneity_cost - 0.05)
+        simultaneity_penalty = (0.1 * max(0.0, simultaneity_cost - 0.05))
+
+        reward -= simultaneity_penalty
 
         self.last_action = action.copy()
 
@@ -327,7 +329,7 @@ class EnvThermalNetwerk:
             "Qh": Qh,
         }
         
-        return (self._obs(), float(reward), done, info)
+        return (self._obs(), float(reward * 0.01), done, info)
     
 # ============================================================
 # 4. Actor-Critic Netzwerk
@@ -339,8 +341,8 @@ class ActorCritic(nn.Module):
         super().__init__()
         self.body = nn.Sequential(
             nn.Linear(obs_dim, 32),
-            # nn.ReLU(),
-            # nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
             nn.ReLU()
         )
 
@@ -418,8 +420,8 @@ class ActorCritic(nn.Module):
 class PPO:
 
     def __init__(self, env, lr=3e-4, gamma=0.99, gae_lambda=0.95,
-                 clip=0.15, epochs=5, batch_size=128, 
-                 rollout=2048, entropy_coef=1e-3,value_coef=0.5):
+             clip=0.20, value_clip=5.0, epochs=10, batch_size=256,
+             rollout=2048, entropy_coef=0.0, value_coef=0.5):
 
         self.env = env
 
@@ -428,20 +430,28 @@ class PPO:
             env.action_dim
         ).to(DEVICE)
 
-        self.opt = torch.optim.Adam(self.net.parameters(),lr=lr,eps=1e-5)
+        self.opt = torch.optim.Adam(
+            self.net.parameters(),
+            lr=lr,
+            eps=1e-5
+        )
+
         self.gamma = gamma
         self.lam = gae_lambda
+
         self.clip = clip
+        self.value_clip = value_clip
+
         self.epochs = epochs
         self.batch = batch_size
         self.rollout = rollout
+
         self.ent_coef = entropy_coef
         self.val_coef = value_coef
 
-        # Umgebung initialisieren
         self.obs = self.env.reset()
 
-        # Trainingshistorie
+        self.current_ep_reward = 0.0
         self.reward_history = []
         self.episode_history = []
         self.temperature_history = []
@@ -461,7 +471,6 @@ class PPO:
         done_buf = []
         ep_rewards = []
 
-        current_ep_reward = 0.0
 
         self.net.eval()
 
@@ -484,18 +493,20 @@ class PPO:
             val_buf.append(value)
             done_buf.append(float(done))
 
-            current_ep_reward += reward
-
-            # Temperatur für Monitoring
-            self.temperature_history.append(info["Tb"])
+            self.current_ep_reward += reward
 
             if done:
-                ep_rewards.append(current_ep_reward)
-                current_ep_reward = 0.0
+                ep_rewards.append(self.current_ep_reward)
+                self.current_ep_reward = 0.0
                 self.obs = self.env.reset()
 
             else:
                 self.obs = next_obs
+
+            
+            # Temperatur für Monitoring
+            self.temperature_history.append(info["Tb"])
+
 
         # Wert des letzten Zustands
         obs_tensor = torch.as_tensor(self.obs,dtype=torch.float32,device=DEVICE)
@@ -549,51 +560,125 @@ class PPO:
     # PPO Update
     # --------------------------------------------------------
 
+    
     def update(self, data):
-        obs, acts, old_logp, advantages, returns = data
+
+        obs, acts, old_logp, old_values, advantages, returns = data
+
         n = len(obs)
+
         clipped_count = 0
         total_count = 0
+
         self.net.train()
+
         for epoch in range(self.epochs):
-            indices = torch.randperm(n,device=DEVICE)
+
+            indices = torch.randperm(n, device=DEVICE)
+
             for start in range(0, n, self.batch):
+
                 batch_indices = indices[start:start + self.batch]
-                logp, entropy, values = self.net.evaluate(obs[batch_indices],acts[batch_indices])
 
-                # Probability Ratio
-                ratio = torch.exp(logp - old_logp[batch_indices])
+                # Policy und Critic auswerten
+                logp, entropy, new_values = self.net.evaluate(
+                    obs[batch_indices],
+                    acts[batch_indices]
+                )
 
-                # PPO Clipping
+                # ------------------------------------------------
+                # Policy Loss (PPO Clipping)
+                # ------------------------------------------------
+
+                log_ratio = logp - old_logp[batch_indices]
+                ratio = torch.exp(log_ratio)
+
                 lower_bound = 1.0 - self.clip
                 upper_bound = 1.0 + self.clip
-                ratio_was_clipped = (ratio < lower_bound) | (ratio > upper_bound)
+
+                ratio_was_clipped = (
+                    (ratio < lower_bound) |
+                    (ratio > upper_bound)
+                )
+
                 clipped_count += int(ratio_was_clipped.sum().item())
                 total_count += len(ratio_was_clipped)
 
-                surr1 = (ratio * advantages[batch_indices])
-                surr2 = (torch.clamp(ratio,lower_bound,upper_bound) * advantages[batch_indices])
-                policy_loss = -torch.min(surr1,surr2).mean()
+                surr1 = ratio * advantages[batch_indices]
 
-                # Critic Loss
-                value_loss = (returns[batch_indices] - values).pow(2).mean()
+                surr2 = torch.clamp(
+                    ratio,
+                    lower_bound,
+                    upper_bound
+                ) * advantages[batch_indices]
 
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # ------------------------------------------------
+                # Value Clipping
+                # ------------------------------------------------
+
+                old_values_batch = old_values[batch_indices]
+
+                returns_batch = returns[batch_indices]
+
+                # Geclippte Value-Vorhersage
+                clipped_values = old_values_batch + torch.clamp(
+                    new_values - old_values_batch,
+                    -self.value_clip,
+                    self.value_clip
+                )
+
+                # Normaler Critic Loss
+                value_loss_unclipped = (
+                    new_values - returns_batch
+                ).pow(2)
+
+                # Geclippter Critic Loss
+                value_loss_clipped = (
+                    clipped_values - returns_batch
+                ).pow(2)
+
+                # Maximum beider Verluste
+                value_loss = 0.5 * torch.maximum(
+                    value_loss_unclipped,
+                    value_loss_clipped
+                ).mean()
+
+                # ------------------------------------------------
                 # Entropie
+                # ------------------------------------------------
+
                 entropy_loss = entropy.mean()
 
+                # ------------------------------------------------
                 # Gesamtverlust
-                loss = (policy_loss + self.val_coef * value_loss - self.ent_coef * entropy_loss)
+                # ------------------------------------------------
+
+                loss = (
+                    policy_loss
+                    + self.val_coef * value_loss
+                    - self.ent_coef * entropy_loss
+                )
 
                 self.opt.zero_grad()
 
                 loss.backward()
 
-                nn.utils.clip_grad_norm_(self.net.parameters(),max_norm=0.5)
+                nn.utils.clip_grad_norm_(
+                    self.net.parameters(),
+                    max_norm=0.5
+                )
 
                 self.opt.step()
 
-        clipped_percentage = 100.0 * clipped_count / total_count if total_count > 0 else 0.0
+        clipped_percentage = (
+            100.0 * clipped_count / total_count
+            if total_count > 0 else 0.0
+        )
+
         return clipped_percentage
+
 
     # --------------------------------------------------------
     # Training
@@ -602,33 +687,52 @@ class PPO:
     def train(self, iterations=300):
 
         for it in range(1, iterations + 1):
+
+            # -----------------------------------------------
+            # Entropy Annealing
+            # -----------------------------------------------
+
+            progress = (it - 1) / max(iterations - 1, 1)
+
             data = self.collect_rollout()
-            (obs,acts,logp,rewards,values,dones,last_val,avg_reward,ep_rewards) = data
 
-            # GAE
-            advantages, returns = self.compute_gae(rewards,values,dones,last_val)
+            (obs, acts, logp, rewards, values,
+            dones, last_val, avg_reward, ep_rewards) = data
 
-            # PPO Update
-            clipped_percentage = self.update((obs,acts,logp,advantages,returns))
+            advantages, returns = self.compute_gae(
+                rewards, values, dones, last_val
+            )
+
+            clipped_percentage = self.update(
+                (obs, acts, logp, values, advantages, returns)
+            )
+
             self.clip_history.append(clipped_percentage)
-
             self.reward_history.append(avg_reward)
 
             if len(ep_rewards) > 0:
                 mean_ep_reward = np.mean(ep_rewards)
                 self.episode_history.append(mean_ep_reward)
-
             else:
                 mean_ep_reward = np.nan
 
-            if np.mod(it, 10) == 0:
+            if it % 10 == 0:
+
+                std = torch.exp(
+                    torch.clamp(
+                        self.net.actor_logstd.detach(),
+                        -5.0,
+                        0.5
+                    )
+                )
+
                 print(
                     f"Iteration {it:4d} | "
                     f"Reward/Step: {avg_reward:9.3f} | "
                     f"Episode Reward: {mean_ep_reward:10.2f} | "
-                    f"Episodes: {len(ep_rewards):2d} | "
-                    f"PPO Clips: {clipped_percentage:6.2f}% | "
-                    f"Std: {self.net.actor_logstd.exp().mean().item():.3f}")
+                    f"Std: {std.mean().item():.4f} | "
+                    f"LogStd: {self.net.actor_logstd.mean().item():.4f}"
+                )
 
         return self.net
 # ============================================================
@@ -653,7 +757,7 @@ if __name__ == "__main__":
     # Training starten
     # --------------------------------------------------------
 
-    net = agent.train(iterations=400)
+    net = agent.train(iterations=2000)
 
     # Modell speichern
     save_path = os.path.expanduser("~/battery_thermal_ppo.pt")
