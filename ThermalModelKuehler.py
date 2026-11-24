@@ -297,7 +297,7 @@ class EnvThermalNetwerk:
         simultaneity_cost = fan_cost * heater_cost
 
         reward = (
-            -0.02 * err ** 2
+            -0.2 * err ** 2
             -0.001 * heater_cost
             -0.001 * fan_cost
             -0.001 * flow_cost ** 2
@@ -417,9 +417,9 @@ class ActorCritic(nn.Module):
 
 class PPO:
 
-    def __init__(self, env, lr=5e-4, gamma=0.995, gae_lambda=0.95,
-                 clip=0.15, epochs=10, batch_size=512, 
-                 rollout=8192, entropy_coef=1e-5,value_coef=0.5):
+    def __init__(self, env, lr=3e-4, gamma=0.99, gae_lambda=0.95,
+                 clip=0.15, epochs=5, batch_size=128, 
+                 rollout=2048, entropy_coef=1e-3,value_coef=0.5):
 
         self.env = env
 
@@ -445,6 +445,7 @@ class PPO:
         self.reward_history = []
         self.episode_history = []
         self.temperature_history = []
+        self.clip_history = []
 
     # --------------------------------------------------------
     # Rollout sammeln
@@ -551,6 +552,8 @@ class PPO:
     def update(self, data):
         obs, acts, old_logp, advantages, returns = data
         n = len(obs)
+        clipped_count = 0
+        total_count = 0
         self.net.train()
         for epoch in range(self.epochs):
             indices = torch.randperm(n,device=DEVICE)
@@ -562,8 +565,14 @@ class PPO:
                 ratio = torch.exp(logp - old_logp[batch_indices])
 
                 # PPO Clipping
+                lower_bound = 1.0 - self.clip
+                upper_bound = 1.0 + self.clip
+                ratio_was_clipped = (ratio < lower_bound) | (ratio > upper_bound)
+                clipped_count += int(ratio_was_clipped.sum().item())
+                total_count += len(ratio_was_clipped)
+
                 surr1 = (ratio * advantages[batch_indices])
-                surr2 = (torch.clamp(ratio,1.0 - self.clip,1.0 + self.clip) * advantages[batch_indices])
+                surr2 = (torch.clamp(ratio,lower_bound,upper_bound) * advantages[batch_indices])
                 policy_loss = -torch.min(surr1,surr2).mean()
 
                 # Critic Loss
@@ -583,6 +592,9 @@ class PPO:
 
                 self.opt.step()
 
+        clipped_percentage = 100.0 * clipped_count / total_count if total_count > 0 else 0.0
+        return clipped_percentage
+
     # --------------------------------------------------------
     # Training
     # --------------------------------------------------------
@@ -597,7 +609,8 @@ class PPO:
             advantages, returns = self.compute_gae(rewards,values,dones,last_val)
 
             # PPO Update
-            self.update((obs,acts,logp,advantages,returns))
+            clipped_percentage = self.update((obs,acts,logp,advantages,returns))
+            self.clip_history.append(clipped_percentage)
 
             self.reward_history.append(avg_reward)
 
@@ -614,6 +627,7 @@ class PPO:
                     f"Reward/Step: {avg_reward:9.3f} | "
                     f"Episode Reward: {mean_ep_reward:10.2f} | "
                     f"Episodes: {len(ep_rewards):2d} | "
+                    f"PPO Clips: {clipped_percentage:6.2f}% | "
                     f"Std: {self.net.actor_logstd.exp().mean().item():.3f}")
 
         return self.net
@@ -639,7 +653,7 @@ if __name__ == "__main__":
     # Training starten
     # --------------------------------------------------------
 
-    net = agent.train(iterations=3000)
+    net = agent.train(iterations=400)
 
     # Modell speichern
     save_path = os.path.expanduser("~/battery_thermal_ppo.pt")
