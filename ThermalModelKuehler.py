@@ -73,12 +73,17 @@ class ThermalModel:
             0.0, 10.0, 50.0, 100.0, 150.0, 200.0, 250.0
         ])
 
-        # Grenzen der Stellgrößen
+        # Grenzen der Stellgrößen        
+        self.Vp_min = 0.1
         self.Vp_max = 20.0
         self.V_max = 200.0
         self.V_add_max = 50.0
         self.Qh_max = 1000.0
         self.Bypass = 1.0
+
+        self.flows = {k: 0.0 for k in
+                ["Q_Hx", "Q_Heater", "Q_Batt", "P_Batt",
+                "Q_Mix_1", "Q_Mix_2", "Q_Mix_3"]}
 
     def reset(self):
 
@@ -149,6 +154,17 @@ class ThermalModel:
 
 
         dT = (Q_trans + Q_mix) * self.dt / self.cp
+
+        # Wärmeströme für Auswertung/Plot ablegen (Werte vor dem Zeitschritt)
+        self.flows = {
+            "Q_Hx":     Q_Hx,            # Luft -> Kühlwasser (Wärmetauscher)
+            "Q_Heater": Qh,              # Heizer -> Kühlwasser
+            "Q_Batt":   Q_Batt,          # Kühlwasser -> Batterie
+            "P_Batt":   P_bat,           # Verlustleistung der Batterie
+            "Q_Mix_1":  Q_mix[1],        # Mischströme der Kühlwasserknoten
+            "Q_Mix_2":  Q_mix[2],
+            "Q_Mix_3":  Q_mix[3],
+        }
 
         self.x = self.x + dT
 
@@ -261,8 +277,7 @@ class EnvThermalNetwerk:
         return (obs - self.OBS_Mean) / self.OBS_Std
 
     def step(self,action):
-
-        Vp      = (action[0] + 1) * 0.5 * self.sys.Vp_max
+        Vp = self.sys.Vp_min + (action[0] + 1) * 0.5 * (self.sys.Vp_max - self.sys.Vp_min)
         V_add   = (action[1] + 1) * 0.5 * self.sys.V_add_max
         Qh      = (action[2] + 1) * 0.5 * self.sys.Qh_max
         Bypass  = (action[3] + 1) * 0.5 * self.sys.Bypass
@@ -297,23 +312,22 @@ class EnvThermalNetwerk:
 
         simultaneity_cost = fan_cost * heater_cost
 
-        reward = (
-            -0.2 * err ** 2
-            -0.02 * heater_cost
-            -0.001 * fan_cost
-            -0.001 * flow_cost ** 2
-            -0.001 * action_change ** 2
-            )
+        reward = 0
+        reward -= 0.05 * err ** 2
+        reward -= 0.05 * heater_cost
+        reward -= 0.001 * fan_cost
+        reward -= 1e-5 * flow_cost
+
+        if err+2 > 0:
+            reward -= 10 * heater_cost ** 2
 
         reward -= 0.01 * Bypass * err
-        reward -= 0.01 * heater_cost * err
         reward += 0.01 * fan_cost * err
-        reward += 0.05 * flow_cost * abs(err) 
 
         if unsafe:
             reward -= 100.0
 
-        simultaneity_penalty = (0.1 * max(0.0, simultaneity_cost - 0.05))
+        simultaneity_penalty = (20.0 * max(0.0, simultaneity_cost - 0.05))
 
         reward -= simultaneity_penalty
 
@@ -329,7 +343,7 @@ class EnvThermalNetwerk:
             "Qh": Qh,
         }
         
-        return (self._obs(), float(reward * 0.01), done, info)
+        return (self._obs(), float(reward), done, info)
     
 # ============================================================
 # 4. Actor-Critic Netzwerk
@@ -421,7 +435,7 @@ class PPO:
 
     def __init__(self, env, lr=3e-4, gamma=0.99, gae_lambda=0.95,
              clip=0.20, value_clip=5.0, epochs=10, batch_size=256,
-             rollout=2048, entropy_coef=0.0, value_coef=0.5):
+             rollout=8192, entropy_coef=0.0, value_coef=0.5):
 
         self.env = env
 
@@ -745,7 +759,7 @@ if __name__ == "__main__":
     # Umgebung
     # --------------------------------------------------------
 
-    env = EnvThermalNetwerk(episode_len=120)
+    env = EnvThermalNetwerk(episode_len=600)
 
     # --------------------------------------------------------
     # PPO Agent
@@ -757,7 +771,7 @@ if __name__ == "__main__":
     # Training starten
     # --------------------------------------------------------
 
-    net = agent.train(iterations=2000)
+    net = agent.train(iterations=500)
 
     # Modell speichern
     save_path = os.path.expanduser("~/battery_thermal_ppo.pt")
@@ -791,7 +805,7 @@ if __name__ == "__main__":
     # 8. Simulation mit trainiertem Regler
     # ========================================================
 
-    env = EnvThermalNetwerk(episode_len=1200)
+    env = EnvThermalNetwerk(episode_len=3600)
 
     obs = env.reset()
 
@@ -806,6 +820,13 @@ if __name__ == "__main__":
     V_add       = np.zeros(n_steps)
     P_Heiz      = np.zeros(n_steps)
     Bypass      = np.zeros(n_steps)
+    Q_Hx        = np.zeros(n_steps)
+    Q_Heater    = np.zeros(n_steps)
+    Q_Batt      = np.zeros(n_steps)
+    P_Batt      = np.zeros(n_steps)
+    Q_Mix_1     = np.zeros(n_steps)
+    Q_Mix_2     = np.zeros(n_steps)
+    Q_Mix_3     = np.zeros(n_steps)
 
     # Solltemperatur speichern
     T_set = env.T_set
@@ -816,6 +837,7 @@ if __name__ == "__main__":
     T_KW_2_1[0] = env.sys.x[2]
     T_KW_2_2[0] = env.sys.x[3]
     T_Batt_0[0] = env.sys.x[4]
+
 
     # Deterministische Policy
     net.eval()
@@ -831,8 +853,17 @@ if __name__ == "__main__":
         action_np = action.cpu().numpy()
         next_obs, reward, done, info = env.step(action_np)
 
+        f = env.sys.flows
+        Q_Hx[i]     = f["Q_Hx"]
+        Q_Heater[i] = f["Q_Heater"]
+        Q_Batt[i]   = f["Q_Batt"]
+        P_Batt[i]   = f["P_Batt"]
+        Q_Mix_1[i]  = f["Q_Mix_1"]
+        Q_Mix_2[i]  = f["Q_Mix_2"]
+        Q_Mix_3[i]  = f["Q_Mix_3"]
+
         # Physikalische Stellgrößen
-        Vp[i]       = ((action_np[0] + 1.0) * 0.5 * env.sys.Vp_max)
+        Vp[i] = env.sys.Vp_min + (action_np[0] + 1.0) * 0.5 * (env.sys.Vp_max - env.sys.Vp_min)
         V_add[i]    = ((action_np[1] + 1.0) * 0.5 * env.sys.V_add_max)
         P_Heiz[i]   = ((action_np[2] + 1.0) * 0.5 * env.sys.Qh_max)
         Bypass[i]   = ((action_np[3] + 1.0) * 0.5 * env.sys.Bypass)
@@ -857,7 +888,7 @@ if __name__ == "__main__":
 
     t = np.arange(n_steps + 1) * env.sys.dt
     t_steps = t[1:]
-    fig, (ax_temp, ax1) = plt.subplots(2, 1,figsize=(13, 9),sharex=True)
+    fig, (ax_temp, ax1, ax_Q) = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
 
     # --------------------------------------------------------
     # Temperaturen
@@ -902,6 +933,24 @@ if __name__ == "__main__":
     ax1.set_xlabel("Zeit [s]")
     ax1.set_title("Stellgrößen des trainierten PPO-Reglers")
     fig.tight_layout()
+
+    # --------------------------------------------------------
+    # Wärmeströme
+    # --------------------------------------------------------
+
+    ax_Q.plot(t_steps, Q_Hx,     label="Q Wärmetauscher (Luft → KW)")
+    ax_Q.plot(t_steps, Q_Heater, label="Q Heizer (→ KW)")
+    ax_Q.plot(t_steps, Q_Batt,   label="Q KW → Batterie")
+    ax_Q.plot(t_steps, P_Batt,   label="P Batterie (Verlustleistung)")
+    # ax_Q.plot(t_steps, Q_Mix_1,  linestyle="--", label="Q Mix KW 2.0")
+    # ax_Q.plot(t_steps, Q_Mix_2,  linestyle="--", label="Q Mix KW 2.1")
+    # ax_Q.plot(t_steps, Q_Mix_3,  linestyle="--", label="Q Mix KW 2.2")
+    ax_Q.axhline(0, color="black", linewidth=0.8)
+    ax_Q.set_ylabel("Wärmestrom [W]")
+    ax_Q.set_xlabel("Zeit [s]")
+    ax_Q.set_title("Wärmeströme im thermischen Modell")
+    ax_Q.legend(loc="upper right", ncol=2, fontsize=8)
+    ax_Q.grid(True)
 
 
 
